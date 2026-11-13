@@ -13,3 +13,115 @@ library(purrr)
 library(leaflet)
 library(jsonlite)
 ```
+
+```{r}
+raw <- read_json("data/wildfires.geojson")
+```
+
+```{r}
+#| cache: true
+fires <- tibble(features = raw$features) |>
+  unnest_wider(features) |>
+  unnest_wider(properties) |>
+  unnest_wider(geometry, names_sep = "_") |>
+  select(incident, gis_acres, fire_year, agency, state, geometry_coordinates) |>
+  mutate(
+    gis_acres = as.numeric(gis_acres),
+    fire_year = as.integer(fire_year)
+  )
+```
+
+```{r}
+august_fires <- fires |>
+  filter(str_detect(incident, regex("\\bAugust\\b", ignore_case = TRUE)))
+
+largest_fires <- fires |>
+  slice_max(gis_acres, n = 10, with_ties = FALSE)
+```
+
+## August fires
+
+There are **`r nrow(august_fires)`** records with “August” in the incident name.
+
+## Ten largest fires
+
+```{r}
+knitr::kable(
+  largest_fires |>
+    select(incident, fire_year, state, agency, gis_acres),
+  digits = 0,
+  col.names = c("Incident", "Year", "State", "Agency", "Acres")
+)
+```
+
+```{r}
+#| cache: true
+fire_shapes <- sf::st_read("data/wildfires.geojson", quiet = TRUE) |>
+  mutate(.source_row = row_number()) |>
+  filter(
+    !sf::st_is_empty(geometry),
+    sf::st_geometry_type(geometry) %in% c("POLYGON", "MULTIPOLYGON")
+  ) |>
+  sf::st_transform(5070) |>
+  sf::st_make_valid()
+
+fire_locations <- fire_shapes |>
+  mutate(geometry = sf::st_point_on_surface(geometry)) |>
+  sf::st_transform(4326) |>
+  mutate(
+    lon = sf::st_coordinates(geometry)[, "X"],
+    lat = sf::st_coordinates(geometry)[, "Y"]
+  ) |>
+  sf::st_drop_geometry() |>
+  select(.source_row, lon, lat)
+
+big_fires <- fires |>
+  mutate(.source_row = row_number()) |>
+  filter(gis_acres >= 100000) |>
+  inner_join(fire_locations, by = ".source_row") |>
+  filter(is.finite(lon), is.finite(lat))
+```
+
+## Boundaries of the ten largest fires
+
+Fill color represents acreage. Select a fire boundary for its name, year, and acreage.
+
+```{r}
+ten_big_fires <- big_fires |>
+  slice_max(gis_acres, n = 10, with_ties = FALSE)
+
+ten_fire_boundaries <- fire_shapes |>
+  filter(.source_row %in% ten_big_fires$.source_row) |>
+  sf::st_transform(4326)
+
+map_bounds <- sf::st_bbox(ten_fire_boundaries)
+acreage_pal <- colorNumeric("YlOrRd", domain = ten_fire_boundaries$gis_acres)
+
+leaflet(ten_fire_boundaries) |>
+  addProviderTiles(providers$CartoDB.Positron) |>
+  addPolygons(
+    color = "#7C2D12",
+    weight = 1,
+    opacity = 0.85,
+    fillColor = ~acreage_pal(gis_acres),
+    fillOpacity = 0.4,
+    popup = ~paste0(
+      "<strong>", htmltools::htmlEscape(incident), "</strong><br/>",
+      "Year: ", fire_year, "<br/>",
+      "Acres: ", format(round(gis_acres), big.mark = ",")
+    )
+  ) |>
+  addLegend(
+    pal = acreage_pal,
+    values = ~gis_acres,
+    title = "Acres burned",
+    position = "bottomright",
+    labFormat = labelFormat(big.mark = ",", digits = 0)
+  ) |>
+  fitBounds(
+    map_bounds[["xmin"]],
+    map_bounds[["ymin"]],
+    map_bounds[["xmax"]],
+    map_bounds[["ymax"]]
+  )
+```
